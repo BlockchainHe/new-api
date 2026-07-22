@@ -229,7 +229,7 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 		newAPIError = service.NormalizeViolationFeeError(newAPIError)
 		relayInfo.LastError = newAPIError
 
-		processChannelError(c, *types.NewChannelError(channel.Id, channel.Type, channel.Name, channel.ChannelInfo.IsMultiKey, common.GetContextKeyString(c, constant.ContextKeyChannelKey), channel.GetAutoBan()), newAPIError)
+		processChannelError(c, relayInfo, *types.NewChannelError(channel.Id, channel.Type, channel.Name, channel.ChannelInfo.IsMultiKey, common.GetContextKeyString(c, constant.ContextKeyChannelKey), channel.GetAutoBan()), newAPIError)
 
 		if !shouldRetry(c, newAPIError, common.RetryTimes-retryParam.GetRetry()) {
 			break
@@ -354,7 +354,49 @@ func shouldRetry(c *gin.Context, openaiErr *types.NewAPIError, retryTimes int) b
 	return operation_setting.ShouldRetryByStatusCode(code)
 }
 
-func processChannelError(c *gin.Context, channelError types.ChannelError, err *types.NewAPIError) {
+const routeForensicsHangThreshold = 120 * time.Second
+
+func appendRouteForensics(c *gin.Context, relayInfo *relaycommon.RelayInfo, statusCode int, useTimeSeconds int, other map[string]interface{}) {
+	if relayInfo == nil || other == nil {
+		return
+	}
+	firstResponseMs := relayInfo.FirstResponseTime.Sub(relayInfo.StartTime).Milliseconds()
+	elapsedMs := int64(useTimeSeconds) * 1000
+	classification := ""
+	thresholdExceeded := false
+	if firstResponseMs < 0 && elapsedMs > routeForensicsHangThreshold.Milliseconds() {
+		classification = "no_first_byte_hang"
+		thresholdExceeded = true
+	} else if statusCode == http.StatusBadGateway {
+		classification = "upstream_502"
+	}
+	if classification == "" {
+		return
+	}
+
+	requestID := relayInfo.RequestId
+	if requestID == "" {
+		requestID = c.GetString(common.RequestIdKey)
+	}
+	forensics := map[string]interface{}{
+		"classification":     classification,
+		"request_id":         requestID,
+		"first_response_ms":  firstResponseMs,
+		"elapsed_ms":         elapsedMs,
+		"retry_index":        relayInfo.RetryIndex,
+		"threshold_exceeded": thresholdExceeded,
+	}
+	if upstreamRequestID := c.GetString(common.UpstreamRequestIdKey); upstreamRequestID != "" {
+		forensics["upstream_request_id"] = upstreamRequestID
+	}
+	other["route_forensics"] = forensics
+
+	if thresholdExceeded {
+		logger.LogWarn(c, fmt.Sprintf("route forensics threshold exceeded: request_id=%s channel_id=%d status_code=%d first_response_ms=%d elapsed_ms=%d retry_index=%d", requestID, c.GetInt("channel_id"), statusCode, firstResponseMs, elapsedMs, relayInfo.RetryIndex))
+	}
+}
+
+func processChannelError(c *gin.Context, relayInfo *relaycommon.RelayInfo, channelError types.ChannelError, err *types.NewAPIError) {
 	logger.LogError(c, fmt.Sprintf("channel error (channel #%d, status code: %d): %s", channelError.ChannelId, err.StatusCode, common.LocalLogPreview(err.Error())))
 	// 不要使用context获取渠道信息，异步处理时可能会出现渠道信息不一致的情况
 	// do not use context to get channel info, there may be inconsistent channel info when processing asynchronously
@@ -396,6 +438,7 @@ func processChannelError(c *gin.Context, channelError types.ChannelError, err *t
 			startTime = time.Now()
 		}
 		useTimeSeconds := int(time.Since(startTime).Seconds())
+		appendRouteForensics(c, relayInfo, err.StatusCode, useTimeSeconds, other)
 		model.RecordErrorLog(c, userId, channelId, modelName, tokenName, err.MaskSensitiveErrorWithStatusCode(), tokenId, useTimeSeconds, common.GetContextKeyBool(c, constant.ContextKeyIsStream), userGroup, other)
 	}
 
@@ -554,7 +597,7 @@ func RelayTask(c *gin.Context) {
 		}
 
 		if !taskErr.LocalError {
-			processChannelError(c,
+			processChannelError(c, relayInfo,
 				*types.NewChannelError(channel.Id, channel.Type, channel.Name, channel.ChannelInfo.IsMultiKey,
 					common.GetContextKeyString(c, constant.ContextKeyChannelKey), channel.GetAutoBan()),
 				types.NewOpenAIError(taskErr.Error, types.ErrorCodeBadResponseStatusCode, taskErr.StatusCode))
