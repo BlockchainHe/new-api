@@ -90,6 +90,11 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 		if newAPIError != nil {
 			logger.LogError(c, fmt.Sprintf("relay error: %s", common.LocalLogPreview(newAPIError.Error())))
 			newAPIError.SetMessage(common.MessageWithRequestId(newAPIError.Error(), requestId))
+			// Once headers/body have started (SSE etc.), never append a second JSON error body.
+			if responseBodyStarted(c) {
+				logger.LogError(c, fmt.Sprintf("relay error after response started; skip error body write (request id: %s)", requestId))
+				return
+			}
 			switch relayFormat {
 			case types.RelayFormatOpenAIRealtime:
 				helper.WssError(c, ws, newAPIError.ToOpenAIError())
@@ -322,8 +327,19 @@ func getChannel(c *gin.Context, info *relaycommon.RelayInfo, retryParam *service
 	return channel, nil
 }
 
+// responseBodyStarted reports whether any response body/status has already been
+// written to the client. After that point channel retries and trailing JSON
+// error bodies would corrupt an in-flight stream (SSE).
+func responseBodyStarted(c *gin.Context) bool {
+	return c != nil && c.Writer != nil && c.Writer.Written()
+}
+
 func shouldRetry(c *gin.Context, openaiErr *types.NewAPIError, retryTimes int) bool {
 	if openaiErr == nil {
+		return false
+	}
+	// Never switch channels after the client already received stream bytes.
+	if responseBodyStarted(c) {
 		return false
 	}
 	if service.ShouldSkipRetryAfterChannelAffinityFailure(c) {
@@ -610,11 +626,18 @@ func respondTaskError(c *gin.Context, taskErr *dto.TaskError) {
 	if taskErr.StatusCode == http.StatusTooManyRequests {
 		taskErr.Message = "当前分组上游负载已饱和，请稍后再试"
 	}
+	if responseBodyStarted(c) {
+		logger.LogError(c, "task error after response started; skip error body write")
+		return
+	}
 	c.JSON(taskErr.StatusCode, taskErr)
 }
 
 func shouldRetryTaskRelay(c *gin.Context, channelId int, taskErr *dto.TaskError, retryTimes int) bool {
 	if taskErr == nil {
+		return false
+	}
+	if responseBodyStarted(c) {
 		return false
 	}
 	if service.ShouldSkipRetryAfterChannelAffinityFailure(c) {
