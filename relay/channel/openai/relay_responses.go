@@ -68,6 +68,20 @@ func OaiResponsesHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http
 	return &usage, nil
 }
 
+// responsesStreamTerminalKey records the legal terminal event type for metrics
+// (e.g. completed vs incomplete). Incomplete is a valid end, not a full-success rate hit.
+const responsesStreamTerminalKey = "responses_stream_terminal"
+
+func applySkipRetryIfResponseStarted(c *gin.Context, apiErr *types.NewAPIError) *types.NewAPIError {
+	if apiErr == nil {
+		return nil
+	}
+	if c != nil && c.Writer != nil && c.Writer.Written() {
+		types.ErrOptionWithSkipRetry()(apiErr)
+	}
+	return apiErr
+}
+
 func OaiResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Response) (*dto.Usage, *types.NewAPIError) {
 	if resp == nil || resp.Body == nil {
 		logger.LogError(c, "invalid response or response body")
@@ -90,18 +104,25 @@ func OaiResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp
 			sr.Error(err)
 			return
 		}
+		// Always forward the raw event once (including failed/error), then decide stop.
 		sendResponsesStreamData(c, streamResponse, data)
 		switch streamResponse.Type {
 		case "response.failed", "response.error":
+			// Event already sent; close stream without [DONE]. Controller must not
+			// retry or append JSON once bytes were written.
 			streamErr = types.NewOpenAIError(
 				fmt.Errorf("responses stream error: %s", streamResponse.Type),
 				types.ErrorCodeBadResponse,
 				http.StatusBadGateway,
+				types.ErrOptionWithSkipRetry(),
 			)
 			sr.Stop(streamErr)
 			return
 		case "response.completed", "response.done", "response.incomplete":
 			terminalEventSeen = true
+			if c != nil {
+				c.Set(responsesStreamTerminalKey, streamResponse.Type)
+			}
 			if streamResponse.Response != nil {
 				if streamResponse.Response.Usage != nil {
 					if streamResponse.Response.Usage.InputTokens != 0 {
@@ -141,14 +162,17 @@ func OaiResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp
 		}
 	})
 	if streamErr != nil {
-		return nil, streamErr
+		// Keep failure for refund; do not emit [DONE].
+		return nil, applySkipRetryIfResponseStarted(c, streamErr)
 	}
 	if !terminalEventSeen {
-		return nil, types.NewOpenAIError(
+		// Mid-stream EOF / client cancel / empty stream: fail without forged [DONE].
+		apiErr := types.NewOpenAIError(
 			fmt.Errorf("responses stream ended before terminal event"),
 			types.ErrorCodeEmptyResponse,
 			http.StatusBadGateway,
 		)
+		return nil, applySkipRetryIfResponseStarted(c, apiErr)
 	}
 
 	if usage.CompletionTokens == 0 {
@@ -166,6 +190,7 @@ func OaiResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp
 	}
 
 	usage.TotalTokens = usage.PromptTokens + usage.CompletionTokens
+	// Single trailing [DONE] only after a legal terminal event (completed/done/incomplete).
 	helper.Done(c)
 
 	return usage, nil
